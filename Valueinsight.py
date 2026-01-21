@@ -62,20 +62,23 @@ def save_db(df: pd.DataFrame):
 
 def compute_derived(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
-    for c in ["kwh_per_session", "sessions_per_week", "plug_in_hour", "plug_out_hour", "value_eur_per_year"]:
-        d[c] = pd.to_numeric(d[c], errors="coerce")
 
-    # window across midnight
+    for c in ["kwh_per_session", "sessions_per_week", "plug_in_hour", "plug_out_hour", "value_eur_per_year"]:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+
+    # window across midnight: 18 -> 6 = (24-18)+6 = 12
     pin = d["plug_in_hour"]
     pout = d["plug_out_hour"]
     d["window_hours"] = np.where(
         pin.isna() | pout.isna(),
         np.nan,
-        np.where(pout >= pin, pout - pin, (24 - pin) + pout)
+        np.where(pout >= pin, pout - pin, (24 - pin) + pout),
     )
 
     d["kwh_per_week"] = d["kwh_per_session"] * d["sessions_per_week"]
 
+    # weekend share heuristic
     wo = d["weekends_only"].fillna(0).astype(int)
     wd = d["weekdays_only"].fillna(0).astype(int)
     s = d["sessions_per_week"]
@@ -89,24 +92,19 @@ def compute_derived(df: pd.DataFrame) -> pd.DataFrame:
     d["is_time_variable_grid_fee"] = d["grid_fee_scenario"].astype(str).str.lower().str.contains("time").astype(int)
     d["market_stack_simple"] = d["market_stack"].astype(str).str.upper().str.replace(" ", "")
 
+    # availability quality proxy (0..1)
     d["availability_quality"] = np.clip((d["window_hours"] - 2) / 12, 0, 1)
 
+    # value density metrics
     d["eur_per_kwh_week"] = d["value_eur_per_year"] / d["kwh_per_week"].replace(0, np.nan)
     d["eur_per_window_hour"] = d["value_eur_per_year"] / d["window_hours"].replace(0, np.nan)
 
-    # "night overlap" proxy: does the window cover midnight and morning low-price windows?
-    # crude: if plug_in <= 22 and plug_out >= 5 (or crosses midnight) then higher overlap
-    pinv = d["plug_in_hour"]
-    poutv = d["plug_out_hour"]
-    crosses = (poutv < pinv)
+    # "overnight overlap" crude proxy
+    crosses = (d["plug_out_hour"] < d["plug_in_hour"])
     d["overnight_overlap"] = np.where(
-        pinv.isna() | poutv.isna(),
+        d["plug_in_hour"].isna() | d["plug_out_hour"].isna(),
         np.nan,
-        np.where(
-            crosses,
-            1.0,  # crosses midnight -> likely overnight overlap
-            np.where((pinv <= 22) & (poutv >= 5), 0.8, 0.3)
-        )
+        np.where(crosses, 1.0, np.where((d["plug_in_hour"] <= 22) & (d["plug_out_hour"] >= 5), 0.8, 0.3))
     )
 
     return d
@@ -156,7 +154,6 @@ def binned_effect(df: pd.DataFrame, feature: str, target: str, bins=6):
 
     xs = x[m]
     ys = y[m]
-
     try:
         q = pd.qcut(xs, q=bins, duplicates="drop")
     except Exception:
@@ -202,69 +199,67 @@ def style_bucket(b):
         return "🔴 LOW"
     return "⚪ UNKNOWN"
 
-def why_value(row):
-    reasons = []
-    kwh_w = safe_float(row.get("kwh_per_week"))
-    w = safe_float(row.get("window_hours"))
-    s = safe_float(row.get("sessions_per_week"))
-    k = safe_float(row.get("kwh_per_session"))
-    tv = int(row.get("is_time_variable_grid_fee", 0) or 0)
-    stack = str(row.get("market_stack", "")).upper()
+def why_value_explainer(row) -> str:
+    """
+    IMPORTANT: always return a STRING (1D),
+    so dff.apply(...) cannot accidentally expand into a DataFrame.
+    """
+    try:
+        reasons = []
+        kwh_w = safe_float(row.get("kwh_per_week"))
+        w = safe_float(row.get("window_hours"))
+        s = safe_float(row.get("sessions_per_week"))
+        k = safe_float(row.get("kwh_per_session"))
+        tv = int(row.get("is_time_variable_grid_fee", 0) or 0)
+        stack = str(row.get("market_stack", "")).upper()
 
-    if not pd.isna(kwh_w):
-        if kwh_w >= 120:
-            reasons.append("High kWh/week → more shiftable volume")
-        elif kwh_w >= 60:
-            reasons.append("Medium kWh/week supports steady value")
-        else:
-            reasons.append("Low kWh/week limits total value")
+        if not pd.isna(kwh_w):
+            if kwh_w >= 120:
+                reasons.append("High kWh/week → more shiftable volume")
+            elif kwh_w >= 60:
+                reasons.append("Medium kWh/week supports steady value")
+            else:
+                reasons.append("Low kWh/week limits total value")
 
-    if not pd.isna(w):
-        if w >= 10:
-            reasons.append("Long window → high temporal freedom")
-        elif w >= 7:
-            reasons.append("Good overnight window → easy optimization")
-        else:
-            reasons.append("Short window → limited flexibility")
+        if not pd.isna(w):
+            if w >= 10:
+                reasons.append("Long window → high temporal freedom")
+            elif w >= 7:
+                reasons.append("Good overnight window → easy optimization")
+            else:
+                reasons.append("Short window → limited flexibility")
 
-    if not pd.isna(s) and not pd.isna(k):
-        if s >= 5 and k <= 18:
-            reasons.append("Frequent smaller sessions → predictable")
-        if s <= 3 and k >= 18:
-            reasons.append("Infrequent large sessions → big per-session shift")
+        if not pd.isna(s) and not pd.isna(k):
+            if s >= 5 and k <= 18:
+                reasons.append("Frequent smaller sessions → predictable")
+            if s <= 3 and k >= 18:
+                reasons.append("Infrequent large sessions → big per-session shift")
 
-    if tv == 1:
-        reasons.append("Time-variable grid fee → extra savings windows")
+        if tv == 1:
+            reasons.append("Time-variable grid fee → extra savings windows")
 
-    if "AFRR" in stack or "FCR" in stack:
-        reasons.append("AS enabled → added upside if reliable")
-    elif "DA+ID" in stack.replace(" ", ""):
-        reasons.append("ID enabled → captures intraday spreads")
+        if ("AFRR" in stack) or ("FCR" in stack):
+            reasons.append("AS enabled → added upside if reliable")
+        elif "DA+ID" in stack.replace(" ", ""):
+            reasons.append("ID enabled → captures intraday spreads")
 
-    if len(reasons) > 4:
-        reasons = reasons[:4]
+        if len(reasons) > 4:
+            reasons = reasons[:4]
 
-    return " • " + "\n • ".join(reasons) if reasons else "—"
+        return " • " + "\n • ".join(reasons) if reasons else "—"
+    except Exception:
+        return "—"
 
-# =========================
-# Graph helpers (no extra libs)
-# =========================
-def make_corr_table(dff):
-    feats = [
-        "kwh_per_session", "sessions_per_week", "kwh_per_week",
-        "window_hours", "weekend_share", "overnight_overlap",
-        "availability_quality", "is_time_variable_grid_fee"
-    ]
-    rows = []
-    for f in feats:
-        rows.append({"driver": f, "corr_with_value": robust_corr(dff, f, "value_eur_per_year")})
-        rows.append({"driver": f, "corr_with_value_density": robust_corr(dff, f, "eur_per_kwh_week")})
-    return pd.DataFrame(rows)
-
-def uplift_table(dff):
-    # Median value by (segment, grid fee, market stack)
-    base = dff.groupby(["segment","grid_fee_scenario","market_stack"])["value_eur_per_year"].median().reset_index()
-    return base.sort_values("value_eur_per_year", ascending=False)
+def safe_apply_to_column(df: pd.DataFrame, func, colname: str) -> pd.DataFrame:
+    """
+    Robust guard: if df.apply returns a DataFrame (2D), take first column.
+    Prevents the ValueError you saw.
+    """
+    out = df.apply(lambda r: func(r), axis=1)
+    if isinstance(out, pd.DataFrame):
+        out = out.iloc[:, 0]
+    df[colname] = out.astype(str)
+    return df
 
 # =========================
 # UI
@@ -276,8 +271,7 @@ if "db" not in st.session_state:
     st.session_state.db = load_db()
 
 db = st.session_state.db
-df = compute_derived(db)
-df = apply_segmentation(df)
+df = apply_segmentation(compute_derived(db))
 
 # Sidebar filters
 st.sidebar.header("Filters")
@@ -302,13 +296,15 @@ cutoffs = compute_global_cutoffs(dff) if len(dff) else {"v_p33": 100.0, "v_p66":
 dff = dff.copy()
 dff["value_bucket"] = dff.apply(lambda r: value_bucket(r, cutoffs), axis=1)
 dff["value_bucket_label"] = dff["value_bucket"].apply(style_bucket)
-dff["why_earns_more"] = dff.apply(why_value, axis=1)
+
+# ✅ robust explainers (prevents your ValueError)
+dff = safe_apply_to_column(dff, why_value_explainer, "why_earns_more")
 
 bucket_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "UNKNOWN": 3}
 dff["bucket_rank"] = dff["value_bucket"].map(bucket_order).fillna(9).astype(int)
 
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-    ["➕ Enter Scenarios", "📋 Database", "🧺 Buckets", "📊 Insights", "🧠 Value Drivers", "📈 Visual Analytics"]
+    ["➕ Enter Scenarios", "📋 Database", "🧺 Buckets", "📊 Insights", "🧠 Drivers", "📈 Visual Analytics"]
 )
 
 # =========================
@@ -321,17 +317,19 @@ with tab1:
     with colA:
         label = st.text_input("Label (short name)", placeholder="e.g., Daily_3kWh_18to6")
         kwh_per_session = st.number_input("kWh per session", min_value=0.0, value=3.0, step=0.5)
+
         frequency_type = st.selectbox(
             "Frequency pattern",
             ["Daily", "X times per week", "Weekdays only", "Weekends only", "Custom days"],
             index=0
         )
+
         if frequency_type == "Daily":
             sessions_per_week = 7
             weekdays_only = 0
             weekends_only = 0
             custom_days = ""
-            st.write("Sessions/week = 7 (fixed for Daily)")
+            st.write("Sessions/week = 7 (Daily)")
         elif frequency_type == "X times per week":
             sessions_per_week = st.number_input("Sessions per week (1–7)", min_value=1, max_value=7, value=3, step=1)
             weekdays_only = 0
@@ -342,20 +340,20 @@ with tab1:
             weekdays_only = 1
             weekends_only = 0
             custom_days = "Mon,Tue,Wed,Thu,Fri"
-            st.write("Sessions/week = 5 (fixed for Weekdays)")
+            st.write("Sessions/week = 5 (Weekdays)")
         elif frequency_type == "Weekends only":
             sessions_per_week = 2
             weekdays_only = 0
             weekends_only = 1
             custom_days = "Sat,Sun"
-            st.write("Sessions/week = 2 (fixed for Weekends)")
+            st.write("Sessions/week = 2 (Weekends)")
         else:
             custom_days = st.text_input("Custom days (comma separated)", value="Mon,Wed,Fri")
             days = [d.strip() for d in custom_days.split(",") if d.strip()]
             sessions_per_week = len(days) if len(days) > 0 else 3
             weekdays_only = 0
             weekends_only = 0
-            st.write(f"Estimated sessions/week = {sessions_per_week} (based on custom days)")
+            st.write(f"Estimated sessions/week = {sessions_per_week}")
 
     with colB:
         st.markdown("**Plug window**")
@@ -535,11 +533,16 @@ with tab5:
     if len(dff) < 10:
         st.info("Add at least ~10 scenarios for the driver analysis to become meaningful.")
     else:
-        feats = ["kwh_per_session","sessions_per_week","kwh_per_week","window_hours","weekend_share","overnight_overlap","availability_quality","is_time_variable_grid_fee"]
+        feats = [
+            "kwh_per_session","sessions_per_week","kwh_per_week",
+            "window_hours","weekend_share","overnight_overlap",
+            "availability_quality","is_time_variable_grid_fee",
+            "eur_per_kwh_week"
+        ]
         corr_rows = [{"feature": f, "corr_with_value": robust_corr(dff, f, "value_eur_per_year")} for f in feats]
         corr_df = pd.DataFrame(corr_rows).sort_values("corr_with_value", ascending=False)
         st.markdown("### Correlation ranking (directional)")
-        st.dataframe(corr_df, use_container_width=True, height=260)
+        st.dataframe(corr_df, use_container_width=True, height=280)
 
         st.markdown("### Binned effects (non-linear patterns)")
         feature_pick = st.selectbox("Pick a feature", ["kwh_per_week","window_hours","sessions_per_week","kwh_per_session","weekend_share","overnight_overlap"])
@@ -551,7 +554,7 @@ with tab5:
         st.dataframe(pivot, use_container_width=True, height=320)
 
 # =========================
-# Tab 6: Visual Analytics (NEW)
+# Tab 6: Visual Analytics (graphs)
 # =========================
 with tab6:
     st.subheader("📈 Visual Analytics (Value vs Drivers) — for proposition design")
@@ -559,74 +562,62 @@ with tab6:
     if len(dff) < 6:
         st.info("Add more scenarios to unlock the charts (recommend 10+).")
     else:
-        # ---- 1) Scatter: Value vs kWh/week (bubble by window hours), colored by segment
-        st.markdown("### 1) Value vs Energy Volume (kWh/week)")
-        chart_df = dff[["kwh_per_week","value_eur_per_year","window_hours","segment","market_stack","grid_fee_scenario","label"]].dropna(subset=["kwh_per_week","value_eur_per_year"])
+        st.markdown("### 1) Value vs kWh/week (volume driver)")
+        chart_df = dff[["kwh_per_week","value_eur_per_year"]].dropna()
         st.scatter_chart(chart_df, x="kwh_per_week", y="value_eur_per_year", height=320)
-        st.caption("Use filters: compare DA vs DA+ID vs aFRR and Standard vs TV grid fee. Look for saturation and outliers (high value with low kWh/week = very efficient).")
+        st.caption("Look for: (a) saturation, (b) high value with low kWh/week = very efficient customer types.")
 
-        # ---- 2) Value vs Window
-        st.markdown("### 2) Value vs Availability Window (hours)")
-        chart_df2 = dff[["window_hours","value_eur_per_year","segment","label"]].dropna(subset=["window_hours","value_eur_per_year"])
+        st.markdown("### 2) Value vs window hours (availability driver)")
+        chart_df2 = dff[["window_hours","value_eur_per_year"]].dropna()
         st.scatter_chart(chart_df2, x="window_hours", y="value_eur_per_year", height=320)
-        st.caption("If value rises strongly with window_hours, you should target customers with long overnight windows and message 'no hassle' automation.")
+        st.caption("If value strongly increases with window, you should gate eligibility and target long overnight windows first.")
 
-        # ---- 3) Box-style view using quantiles per segment (p10/p50/p90)
-        st.markdown("### 3) Segment Value Bands (p10 / p50 / p90)")
+        st.markdown("### 3) Efficiency: €/year per kWh/week (bang-for-buck)")
+        eff = dff[["eur_per_kwh_week"]].dropna()
+        if len(eff) >= 10:
+            cap = float(np.nanpercentile(eff["eur_per_kwh_week"], 95))
+            eff_plot = eff.copy()
+            eff_plot["eur_per_kwh_week_clamped"] = eff_plot["eur_per_kwh_week"].clip(upper=cap)
+            st.line_chart(eff_plot["eur_per_kwh_week_clamped"], height=220)
+            st.caption("The 95% clamp avoids one extreme point ruining the chart.")
+        else:
+            st.line_chart(eff["eur_per_kwh_week"], height=220)
+
+        st.markdown("### 4) Segment value bands (p10/p50/p90)")
         seg = dff.groupby("segment").agg(
             n=("value_eur_per_year","size"),
             p10=("value_eur_per_year", lambda x: np.nanpercentile(x,10)),
             p50=("value_eur_per_year", lambda x: np.nanpercentile(x,50)),
             p90=("value_eur_per_year", lambda x: np.nanpercentile(x,90)),
         ).reset_index().sort_values("p50", ascending=False)
-
         st.dataframe(seg, use_container_width=True, height=260)
         st.line_chart(seg.set_index("segment")[["p10","p50","p90"]], height=320)
-        st.caption("Wide p10–p90 means volatile outcomes; consider Hybrid propositions (base + top-up) for those segments.")
+        st.caption("Wide p10–p90 means volatile value → consider HYBRID proposition (base + performance top-up).")
 
-        # ---- 4) Market stack uplift: median by stack
-        st.markdown("### 4) Median Value by Market Stack")
+        st.markdown("### 5) Median value by market stack")
         stack_med = dff.groupby("market_stack")["value_eur_per_year"].median().sort_values(ascending=False)
-        st.bar_chart(stack_med, height=320)
-        st.caption("If DA+ID or aFRR adds value only for a small subset, do NOT build a broad proposition—gate eligibility by segment/window.")
+        st.bar_chart(stack_med, height=300)
 
-        # ---- 5) Grid fee scenario comparison
-        st.markdown("### 5) Standard vs Time-variable Grid Fee (median)")
+        st.markdown("### 6) Median value by grid fee scenario")
         grid_med = dff.groupby("grid_fee_scenario")["value_eur_per_year"].median().sort_values(ascending=False)
-        st.bar_chart(grid_med, height=280)
+        st.bar_chart(grid_med, height=260)
 
-        # ---- 6) Efficiency chart: €/year per kWh/week
-        st.markdown("### 6) Efficiency: €/year per kWh/week")
-        eff = dff[["eur_per_kwh_week","segment","market_stack","grid_fee_scenario","label"]].dropna(subset=["eur_per_kwh_week"])
-        # clamp extreme values for nicer visuals
-        cap = np.nanpercentile(eff["eur_per_kwh_week"], 95) if len(eff) >= 10 else eff["eur_per_kwh_week"].max()
-        eff2 = eff.copy()
-        eff2["eur_per_kwh_week_clamped"] = eff2["eur_per_kwh_week"].clip(upper=cap)
-        st.scatter_chart(eff2, x="eur_per_kwh_week_clamped", y=None, height=120)  # simple distribution-like
-        st.dataframe(eff2.sort_values("eur_per_kwh_week", ascending=False).head(15), use_container_width=True, height=260)
-        st.caption("This finds customer types that are 'cheap to incentivize' (high value per unit energy). Great for early MVP targeting.")
-
-        # ---- 7) Proposition cues (auto summary)
-        st.markdown("### 7) What to look at for proposition design (auto cues)")
-        # Simple cues
+        st.markdown("### 7) What to look at (auto cues)")
         tv = dff["is_time_variable_grid_fee"] == 1
         std = dff["is_time_variable_grid_fee"] == 0
         if tv.sum() >= 3 and std.sum() >= 3:
             tv_med = float(np.nanmedian(dff.loc[tv, "value_eur_per_year"]))
             std_med = float(np.nanmedian(dff.loc[std, "value_eur_per_year"]))
-            st.write(f"- **TV grid fee uplift** (median): **{(tv_med - std_med):+.1f} €/y** (TV={tv_med:.1f}, Standard={std_med:.1f})")
+            st.write(f"- **TV grid fee uplift (median)**: **{(tv_med - std_med):+.1f} €/y** (TV={tv_med:.1f}, Standard={std_med:.1f})")
 
-        # Window cue
         w = dff["window_hours"].dropna()
         if len(w) >= 10:
-            w_q = np.nanpercentile(w, [25, 50, 75])
-            st.write(f"- Typical window (h): p25={w_q[0]:.1f}, p50={w_q[1]:.1f}, p75={w_q[2]:.1f}. Consider 'eligibility tiers' by window length.")
+            q25, q50, q75 = np.nanpercentile(w, [25, 50, 75])
+            st.write(f"- Typical window hours: p25={q25:.1f}, p50={q50:.1f}, p75={q75:.1f} → consider eligibility tiers by window length.")
 
-        # Stack cue
         if dff["market_stack"].nunique() >= 2:
             ms = dff.groupby("market_stack")["value_eur_per_year"].median().sort_values(ascending=False)
-            top_stack = ms.index[0]
-            st.write(f"- Best-performing market stack (median within filters): **{top_stack}** ({ms.iloc[0]:.1f} €/y).")
+            st.write(f"- Best market stack (median under filters): **{ms.index[0]}** ({ms.iloc[0]:.1f} €/y)")
 
 st.markdown(
     "<div style='margin-top:16px; font-size:12px; color:#777;'>"

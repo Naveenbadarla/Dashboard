@@ -3,6 +3,9 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+# Plotly (make sure it's in requirements.txt)
+import plotly.express as px
+
 st.set_page_config(page_title="EV Flex Value Segmentation Lab", page_icon="⚡", layout="wide")
 
 # =========================
@@ -67,7 +70,7 @@ def compute_derived(df: pd.DataFrame) -> pd.DataFrame:
         if c in d.columns:
             d[c] = pd.to_numeric(d[c], errors="coerce")
 
-    # window across midnight: 18 -> 6 = (24-18)+6 = 12
+    # Plug window across midnight (18 -> 6 = 12h)
     pin = d["plug_in_hour"]
     pout = d["plug_out_hour"]
     d["window_hours"] = np.where(
@@ -78,7 +81,7 @@ def compute_derived(df: pd.DataFrame) -> pd.DataFrame:
 
     d["kwh_per_week"] = d["kwh_per_session"] * d["sessions_per_week"]
 
-    # weekend share heuristic
+    # Weekend share heuristic
     wo = d["weekends_only"].fillna(0).astype(int)
     wd = d["weekdays_only"].fillna(0).astype(int)
     s = d["sessions_per_week"]
@@ -92,14 +95,12 @@ def compute_derived(df: pd.DataFrame) -> pd.DataFrame:
     d["is_time_variable_grid_fee"] = d["grid_fee_scenario"].astype(str).str.lower().str.contains("time").astype(int)
     d["market_stack_simple"] = d["market_stack"].astype(str).str.upper().str.replace(" ", "")
 
-    # availability quality proxy (0..1)
     d["availability_quality"] = np.clip((d["window_hours"] - 2) / 12, 0, 1)
 
-    # value density metrics
     d["eur_per_kwh_week"] = d["value_eur_per_year"] / d["kwh_per_week"].replace(0, np.nan)
     d["eur_per_window_hour"] = d["value_eur_per_year"] / d["window_hours"].replace(0, np.nan)
 
-    # "overnight overlap" crude proxy
+    # Overnight overlap proxy
     crosses = (d["plug_out_hour"] < d["plug_in_hour"])
     d["overnight_overlap"] = np.where(
         d["plug_in_hour"].isna() | d["plug_out_hour"].isna(),
@@ -200,10 +201,6 @@ def style_bucket(b):
     return "⚪ UNKNOWN"
 
 def why_value_explainer(row) -> str:
-    """
-    IMPORTANT: always return a STRING (1D),
-    so dff.apply(...) cannot accidentally expand into a DataFrame.
-    """
     try:
         reasons = []
         kwh_w = safe_float(row.get("kwh_per_week"))
@@ -251,10 +248,6 @@ def why_value_explainer(row) -> str:
         return "—"
 
 def safe_apply_to_column(df: pd.DataFrame, func, colname: str) -> pd.DataFrame:
-    """
-    Robust guard: if df.apply returns a DataFrame (2D), take first column.
-    Prevents the ValueError you saw.
-    """
     out = df.apply(lambda r: func(r), axis=1)
     if isinstance(out, pd.DataFrame):
         out = out.iloc[:, 0]
@@ -262,9 +255,111 @@ def safe_apply_to_column(df: pd.DataFrame, func, colname: str) -> pd.DataFrame:
     return df
 
 # =========================
+# Plot helpers
+# =========================
+def plot_scatter_value_vs(dff: pd.DataFrame, x: str, title: str):
+    dd = dff.dropna(subset=[x, "value_eur_per_year"]).copy()
+    if dd.empty:
+        return None
+
+    # Make size sane
+    if "window_hours" in dd.columns:
+        dd["window_hours_size"] = dd["window_hours"].fillna(dd["window_hours"].median())
+        dd["window_hours_size"] = dd["window_hours_size"].clip(lower=1, upper=np.nanpercentile(dd["window_hours_size"], 95))
+    else:
+        dd["window_hours_size"] = 8
+
+    fig = px.scatter(
+        dd,
+        x=x,
+        y="value_eur_per_year",
+        color="segment",
+        symbol="market_stack",
+        facet_col="grid_fee_scenario" if dd["grid_fee_scenario"].nunique() <= 4 else None,
+        size="window_hours_size",
+        size_max=28,
+        hover_name="label",
+        hover_data={
+            "segment": True,
+            "market_stack": True,
+            "grid_fee_scenario": True,
+            "kwh_per_session": True,
+            "sessions_per_week": True,
+            "kwh_per_week": True,
+            "plug_in_hour": True,
+            "plug_out_hour": True,
+            "window_hours": True,
+            "eur_per_kwh_week": True,
+            "scenario_tag": True,
+        },
+        title=title
+    )
+    fig.update_layout(
+        height=520,
+        margin=dict(l=20, r=20, t=60, b=20),
+        legend_title_text="Segment",
+    )
+    fig.update_yaxes(title="Value (€/year)")
+    fig.update_xaxes(title=x.replace("_", " "))
+    return fig
+
+def plot_box_by_segment(dff: pd.DataFrame, title: str):
+    dd = dff.dropna(subset=["segment", "value_eur_per_year"]).copy()
+    if dd.empty:
+        return None
+    fig = px.box(
+        dd,
+        x="segment",
+        y="value_eur_per_year",
+        color="segment",
+        points="all",
+        hover_name="label",
+        hover_data=["market_stack", "grid_fee_scenario", "kwh_per_week", "window_hours", "eur_per_kwh_week"],
+        title=title
+    )
+    fig.update_layout(height=520, margin=dict(l=20, r=20, t=60, b=20))
+    fig.update_xaxes(title="Segment")
+    fig.update_yaxes(title="Value (€/year)")
+    return fig
+
+def plot_bar_median(dff: pd.DataFrame, group_col: str, title: str):
+    dd = dff.dropna(subset=[group_col, "value_eur_per_year"]).copy()
+    if dd.empty:
+        return None
+    med = dd.groupby(group_col)["value_eur_per_year"].median().reset_index().sort_values("value_eur_per_year", ascending=False)
+    fig = px.bar(med, x=group_col, y="value_eur_per_year", title=title)
+    fig.update_layout(height=420, margin=dict(l=20, r=20, t=60, b=20))
+    fig.update_xaxes(title=group_col)
+    fig.update_yaxes(title="Median value (€/year)")
+    return fig
+
+def plot_efficiency_leaderboard(dff: pd.DataFrame, title: str):
+    dd = dff.dropna(subset=["eur_per_kwh_week", "value_eur_per_year"]).copy()
+    if dd.empty:
+        return None
+    # avoid infinities
+    dd = dd.replace([np.inf, -np.inf], np.nan).dropna(subset=["eur_per_kwh_week"])
+    if dd.empty:
+        return None
+    dd = dd.sort_values("eur_per_kwh_week", ascending=False).head(25)
+    fig = px.bar(
+        dd[::-1],
+        x="eur_per_kwh_week",
+        y="label",
+        color="segment",
+        hover_data=["value_eur_per_year", "kwh_per_week", "window_hours", "market_stack", "grid_fee_scenario"],
+        title=title,
+        orientation="h"
+    )
+    fig.update_layout(height=600, margin=dict(l=20, r=20, t=60, b=20))
+    fig.update_xaxes(title="€/year per kWh/week")
+    fig.update_yaxes(title="Customer type (label)")
+    return fig
+
+# =========================
 # UI
 # =========================
-st.title("⚡ EV Flex Value Segmentation Lab")
+st.title("⚡ EV Flex Value Segmentation Lab (Plotly)")
 st.caption("Manual scenario logging → segmentation → bucketing → insights → drivers → visual analytics for proposition design.")
 
 if "db" not in st.session_state:
@@ -291,20 +386,18 @@ if grid_options:
 if seg_options:
     dff = dff[dff["segment"].astype(str).isin(f_seg)]
 
-# Buckets computed on filtered data
+# Buckets (computed on filtered data)
 cutoffs = compute_global_cutoffs(dff) if len(dff) else {"v_p33": 100.0, "v_p66": 200.0}
 dff = dff.copy()
 dff["value_bucket"] = dff.apply(lambda r: value_bucket(r, cutoffs), axis=1)
 dff["value_bucket_label"] = dff["value_bucket"].apply(style_bucket)
-
-# ✅ robust explainers (prevents your ValueError)
 dff = safe_apply_to_column(dff, why_value_explainer, "why_earns_more")
 
 bucket_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "UNKNOWN": 3}
 dff["bucket_rank"] = dff["value_bucket"].map(bucket_order).fillna(9).astype(int)
 
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-    ["➕ Enter Scenarios", "📋 Database", "🧺 Buckets", "📊 Insights", "🧠 Drivers", "📈 Visual Analytics"]
+    ["➕ Enter Scenarios", "📋 Database", "🧺 Buckets", "📊 Insights", "🧠 Drivers", "📈 Visual Analytics (Plotly)"]
 )
 
 # =========================
@@ -323,7 +416,6 @@ with tab1:
             ["Daily", "X times per week", "Weekdays only", "Weekends only", "Custom days"],
             index=0
         )
-
         if frequency_type == "Daily":
             sessions_per_week = 7
             weekdays_only = 0
@@ -359,7 +451,6 @@ with tab1:
         st.markdown("**Plug window**")
         plug_in_hour = st.number_input("Plug-in hour (0–23)", min_value=0, max_value=23, value=18, step=1)
         plug_out_hour = st.number_input("Plug-out hour (0–23)", min_value=0, max_value=23, value=6, step=1)
-        st.caption("If plug-out < plug-in, it crosses midnight (e.g., 18 → 6 = 12h).")
 
         st.markdown("**Scenario setup**")
         market_stack = st.selectbox(
@@ -409,7 +500,7 @@ with tab1:
         db2 = pd.concat([db, pd.DataFrame([new_row])], ignore_index=True)
         st.session_state.db = db2
         save_db(db2)
-        st.success("Saved. Check Buckets + Visual Analytics tabs.")
+        st.success("Saved. Check the Visual Analytics tab.")
         st.rerun()
 
 # =========================
@@ -437,7 +528,8 @@ with tab2:
     colx, coly = st.columns([1,1])
     with colx:
         csv_bytes = dff.to_csv(index=False).encode("utf-8")
-        st.download_button("⬇️ Download filtered CSV", data=csv_bytes, file_name="ev_value_db_filtered.csv", mime="text/csv", use_container_width=True)
+        st.download_button("⬇️ Download filtered CSV", data=csv_bytes, file_name="ev_value_db_filtered.csv",
+                           mime="text/csv", use_container_width=True)
     with coly:
         if st.button("🗑️ Delete ALL entries (danger)", type="secondary", use_container_width=True):
             st.session_state.db = pd.DataFrame(columns=BASE_COLUMNS)
@@ -468,18 +560,10 @@ with tab3:
         c3.metric("🔴 LOW", int(bucket_counts.get("LOW", 0)))
         c4.metric("⚪ UNKNOWN", int(bucket_counts.get("UNKNOWN", 0)))
 
-        st.markdown("### Bucket map by Segment")
-        seg_bucket = dff.pivot_table(index="segment", columns="value_bucket", values="entry_id", aggfunc="count", fill_value=0)
-        for col in ["HIGH","MEDIUM","LOW","UNKNOWN"]:
-            if col not in seg_bucket.columns:
-                seg_bucket[col] = 0
-        seg_bucket = seg_bucket[["HIGH","MEDIUM","LOW","UNKNOWN"]].sort_values(["HIGH","MEDIUM","LOW"], ascending=False)
-        st.dataframe(seg_bucket, use_container_width=True, height=260)
-
         st.markdown("### High-value customer types (with 'why' explanation)")
         top_high = dff[dff["value_bucket"] == "HIGH"].sort_values("value_eur_per_year", ascending=False)
         if len(top_high) == 0:
-            st.info("No HIGH rows under current filters. Try removing filters or add more entries.")
+            st.info("No HIGH rows under current filters.")
         else:
             show = [
                 "value_bucket_label","label","segment",
@@ -517,21 +601,15 @@ with tab4:
             win=("window_hours","mean"),
             eur_per_kwhwk=("eur_per_kwh_week","mean")
         ).reset_index().sort_values(["p50","n"], ascending=[False, False])
-
-        st.markdown("### Segment signatures (by market stack & grid fee scenario)")
-        st.dataframe(sig, use_container_width=True, height=360)
-
-        st.markdown("### Best rows by scenario (top median value)")
-        topN = st.slider("Top N rows", 5, 25, 10)
-        st.dataframe(sig.head(topN), use_container_width=True)
+        st.dataframe(sig, use_container_width=True, height=420)
 
 # =========================
-# Tab 5: Drivers (tables)
+# Tab 5: Drivers
 # =========================
 with tab5:
     st.subheader("Value drivers (tables)")
     if len(dff) < 10:
-        st.info("Add at least ~10 scenarios for the driver analysis to become meaningful.")
+        st.info("Add at least ~10 scenarios for meaningful driver analysis.")
     else:
         feats = [
             "kwh_per_session","sessions_per_week","kwh_per_week",
@@ -541,83 +619,82 @@ with tab5:
         ]
         corr_rows = [{"feature": f, "corr_with_value": robust_corr(dff, f, "value_eur_per_year")} for f in feats]
         corr_df = pd.DataFrame(corr_rows).sort_values("corr_with_value", ascending=False)
-        st.markdown("### Correlation ranking (directional)")
-        st.dataframe(corr_df, use_container_width=True, height=280)
+        st.dataframe(corr_df, use_container_width=True, height=320)
 
-        st.markdown("### Binned effects (non-linear patterns)")
-        feature_pick = st.selectbox("Pick a feature", ["kwh_per_week","window_hours","sessions_per_week","kwh_per_session","weekend_share","overnight_overlap"])
+        feature_pick = st.selectbox(
+            "Binned effect feature",
+            ["kwh_per_week","window_hours","sessions_per_week","kwh_per_session","weekend_share","overnight_overlap"]
+        )
         be = binned_effect(dff, feature_pick, "value_eur_per_year", bins=6)
-        st.dataframe(be, use_container_width=True, height=240)
-
-        st.markdown("### Segment × Market Stack (median value table)")
-        pivot = dff.pivot_table(index="segment", columns="market_stack", values="value_eur_per_year", aggfunc="median")
-        st.dataframe(pivot, use_container_width=True, height=320)
+        st.dataframe(be, use_container_width=True, height=260)
 
 # =========================
-# Tab 6: Visual Analytics (graphs)
+# Tab 6: Plotly Visual Analytics
 # =========================
 with tab6:
-    st.subheader("📈 Visual Analytics (Value vs Drivers) — for proposition design")
+    st.subheader("📈 Visual Analytics (Plotly): value vs drivers + proposition cues")
 
     if len(dff) < 6:
         st.info("Add more scenarios to unlock the charts (recommend 10+).")
     else:
-        st.markdown("### 1) Value vs kWh/week (volume driver)")
-        chart_df = dff[["kwh_per_week","value_eur_per_year"]].dropna()
-        st.scatter_chart(chart_df, x="kwh_per_week", y="value_eur_per_year", height=320)
-        st.caption("Look for: (a) saturation, (b) high value with low kWh/week = very efficient customer types.")
+        left, right = st.columns([1, 1])
+        with left:
+            x_choice = st.selectbox(
+                "X-axis driver",
+                ["kwh_per_week", "window_hours", "sessions_per_week", "kwh_per_session", "overnight_overlap", "weekend_share"],
+                index=0
+            )
+        with right:
+            show_box = st.checkbox("Show Segment Box Plot", value=True)
 
-        st.markdown("### 2) Value vs window hours (availability driver)")
-        chart_df2 = dff[["window_hours","value_eur_per_year"]].dropna()
-        st.scatter_chart(chart_df2, x="window_hours", y="value_eur_per_year", height=320)
-        st.caption("If value strongly increases with window, you should gate eligibility and target long overnight windows first.")
-
-        st.markdown("### 3) Efficiency: €/year per kWh/week (bang-for-buck)")
-        eff = dff[["eur_per_kwh_week"]].dropna()
-        if len(eff) >= 10:
-            cap = float(np.nanpercentile(eff["eur_per_kwh_week"], 95))
-            eff_plot = eff.copy()
-            eff_plot["eur_per_kwh_week_clamped"] = eff_plot["eur_per_kwh_week"].clip(upper=cap)
-            st.line_chart(eff_plot["eur_per_kwh_week_clamped"], height=220)
-            st.caption("The 95% clamp avoids one extreme point ruining the chart.")
+        fig1 = plot_scatter_value_vs(dff, x_choice, f"Value vs {x_choice} (color=segment, symbol=market, size=window)")
+        if fig1 is not None:
+            st.plotly_chart(fig1, use_container_width=True)
         else:
-            st.line_chart(eff["eur_per_kwh_week"], height=220)
+            st.info("Not enough data to plot this chart.")
 
-        st.markdown("### 4) Segment value bands (p10/p50/p90)")
-        seg = dff.groupby("segment").agg(
-            n=("value_eur_per_year","size"),
-            p10=("value_eur_per_year", lambda x: np.nanpercentile(x,10)),
-            p50=("value_eur_per_year", lambda x: np.nanpercentile(x,50)),
-            p90=("value_eur_per_year", lambda x: np.nanpercentile(x,90)),
-        ).reset_index().sort_values("p50", ascending=False)
-        st.dataframe(seg, use_container_width=True, height=260)
-        st.line_chart(seg.set_index("segment")[["p10","p50","p90"]], height=320)
-        st.caption("Wide p10–p90 means volatile value → consider HYBRID proposition (base + performance top-up).")
+        st.markdown("### Efficiency leaderboard (best bang-for-buck)")
+        fig_eff = plot_efficiency_leaderboard(dff, "Top customer types by €/year per kWh/week")
+        if fig_eff is not None:
+            st.plotly_chart(fig_eff, use_container_width=True)
+        else:
+            st.info("Need valid eur_per_kwh_week values to show this.")
 
-        st.markdown("### 5) Median value by market stack")
-        stack_med = dff.groupby("market_stack")["value_eur_per_year"].median().sort_values(ascending=False)
-        st.bar_chart(stack_med, height=300)
+        st.markdown("### Market stack & grid-fee comparison (median)")
+        c1, c2 = st.columns(2)
+        with c1:
+            fig_ms = plot_bar_median(dff, "market_stack", "Median value by market stack")
+            if fig_ms is not None:
+                st.plotly_chart(fig_ms, use_container_width=True)
+        with c2:
+            fig_gf = plot_bar_median(dff, "grid_fee_scenario", "Median value by grid fee scenario")
+            if fig_gf is not None:
+                st.plotly_chart(fig_gf, use_container_width=True)
 
-        st.markdown("### 6) Median value by grid fee scenario")
-        grid_med = dff.groupby("grid_fee_scenario")["value_eur_per_year"].median().sort_values(ascending=False)
-        st.bar_chart(grid_med, height=260)
+        if show_box:
+            fig_box = plot_box_by_segment(dff, "Value distribution by segment (box + points)")
+            if fig_box is not None:
+                st.plotly_chart(fig_box, use_container_width=True)
 
-        st.markdown("### 7) What to look at (auto cues)")
+        st.markdown("### Proposition cues (auto)")
         tv = dff["is_time_variable_grid_fee"] == 1
         std = dff["is_time_variable_grid_fee"] == 0
         if tv.sum() >= 3 and std.sum() >= 3:
             tv_med = float(np.nanmedian(dff.loc[tv, "value_eur_per_year"]))
             std_med = float(np.nanmedian(dff.loc[std, "value_eur_per_year"]))
-            st.write(f"- **TV grid fee uplift (median)**: **{(tv_med - std_med):+.1f} €/y** (TV={tv_med:.1f}, Standard={std_med:.1f})")
-
-        w = dff["window_hours"].dropna()
-        if len(w) >= 10:
-            q25, q50, q75 = np.nanpercentile(w, [25, 50, 75])
-            st.write(f"- Typical window hours: p25={q25:.1f}, p50={q50:.1f}, p75={q75:.1f} → consider eligibility tiers by window length.")
+            st.write(f"- **TV grid-fee uplift (median)**: **{(tv_med - std_med):+.1f} €/y** (TV={tv_med:.1f}, Standard={std_med:.1f})")
 
         if dff["market_stack"].nunique() >= 2:
             ms = dff.groupby("market_stack")["value_eur_per_year"].median().sort_values(ascending=False)
-            st.write(f"- Best market stack (median under filters): **{ms.index[0]}** ({ms.iloc[0]:.1f} €/y)")
+            st.write(f"- Best market stack under current filters: **{ms.index[0]}** (median {ms.iloc[0]:.1f} €/y)")
+            if len(ms) >= 2:
+                st.write(f"- Second best: **{ms.index[1]}** (median {ms.iloc[1]:.1f} €/y)")
+
+        # Eligible gating suggestion by window
+        w = dff["window_hours"].dropna()
+        if len(w) >= 10:
+            q25, q50, q75 = np.nanpercentile(w, [25, 50, 75])
+            st.write(f"- Typical window: p25={q25:.1f}h, p50={q50:.1f}h, p75={q75:.1f}h → consider eligibility tiers by window length.")
 
 st.markdown(
     "<div style='margin-top:16px; font-size:12px; color:#777;'>"

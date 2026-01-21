@@ -1,645 +1,484 @@
-# app.py
-# Streamlit "Flex Value Insights" — turns valuation runs into segments + insights + roadmap
-# Copy-paste, then run:  streamlit run app.py
-
+import os
 import math
 import numpy as np
 import pandas as pd
 import streamlit as st
-import plotly.express as px
-import plotly.graph_objects as go
 
-st.set_page_config(page_title="Flex Value Insights", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="EV Flex Value Segmentation Lab", page_icon="⚡", layout="wide")
 
-# =========================================================
-# 0) Expected schema (flexible, missing columns handled)
-# =========================================================
-RECOMMENDED_COLUMNS = [
-    # Identity / context
-    "asset_type",          # "EV", "PV_BATTERY", "HEAT_PUMP"
-    "country",             # e.g., "DE"
-    "dso",                 # e.g., "Westnetz"
-    "price_regime",        # e.g., "2024_hist", "2025_hist", "stress_high_vol"
-    "market_stack",        # e.g., "DA+ID", "DA+ID+FCR", ...
+# =========================
+# Storage
+# =========================
+DATA_DIR = "data"
+os.makedirs(DATA_DIR, exist_ok=True)
+DB_PATH = os.path.join(DATA_DIR, "ev_value_db.csv")
 
-    # Behavior / flexibility features (EV-centric, OK if NA for others)
-    "sessions_per_week",
+BASE_COLUMNS = [
+    "entry_id",
+    "created_ts",
+    "label",
+
+    # Customer behavior inputs
     "kwh_per_session",
-    "avg_window_hours",    # availability window length (plug-in to plug-out)
-    "override_rate",       # 0..1
-    "plugin_hour_mean",    # 0..23 (optional)
-    "plugout_hour_mean",   # 0..23 (optional)
-    "min_soc",             # 0..1 (optional)
-    "target_soc_departure",# 0..1 (optional)
+    "frequency_type",          # daily / x_per_week / weekdays / weekends / custom
+    "sessions_per_week",       # numeric
+    "weekdays_only",           # 0/1
+    "weekends_only",           # 0/1
+    "custom_days",             # string like "Mon,Tue,Wed"
+    "plug_in_hour",            # 0..23
+    "plug_out_hour",           # 0..23
 
-    # Asset technical (optional)
-    "ev_max_kw",
-    "ev_battery_kwh",
-    "pv_kwp",
-    "battery_kwh",
-    "hp_thermal_storage_kwhth",
-    "comfort_band_c",
+    # Optimization / scenario inputs
+    "market_stack",            # DA / DA+ID / DA+ID+aFRR / etc.
+    "grid_fee_scenario",       # Standard / Time-variable / custom
+    "scenario_tag",            # free text (future)
+    "value_eur_per_year",      # target metric
 
-    # Outputs
-    "value_total_eur_y",
-    "value_da_eur_y",
-    "value_id_eur_y",
-    "value_as_eur_y",      # ancillary services aggregated (FCR/aFRR)
-    "reliability_score",   # 0..1 (if you have it); else derived proxy
-    "customer_impact_score" # 0..1 higher = more impact (if you have it); else derived proxy
+    # Optional notes
+    "notes",
 ]
 
-# =========================================================
-# 1) Utilities
-# =========================================================
-def _clamp01(x):
+# =========================
+# Helpers
+# =========================
+def now_ts():
+    return pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+def safe_float(x):
     try:
-        return float(max(0.0, min(1.0, x)))
+        if x is None or (isinstance(x, str) and x.strip() == ""):
+            return np.nan
+        return float(x)
     except Exception:
         return np.nan
 
-def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
+def safe_int(x):
+    try:
+        if x is None or (isinstance(x, str) and x.strip() == ""):
+            return np.nan
+        return int(x)
+    except Exception:
+        return np.nan
 
-    # Normalize column names a bit
-    df.columns = [c.strip() for c in df.columns]
+def load_db() -> pd.DataFrame:
+    if os.path.exists(DB_PATH):
+        df = pd.read_csv(DB_PATH)
+        # Ensure all expected columns exist
+        for c in BASE_COLUMNS:
+            if c not in df.columns:
+                df[c] = np.nan
+        df = df[BASE_COLUMNS]
+        return df
+    return pd.DataFrame(columns=BASE_COLUMNS)
 
-    # Minimal required
-    if "asset_type" not in df.columns:
-        df["asset_type"] = "EV"  # default guess
+def save_db(df: pd.DataFrame):
+    df.to_csv(DB_PATH, index=False)
 
-    # Derivations
-    if "kwh_per_week" not in df.columns:
-        if "sessions_per_week" in df.columns and "kwh_per_session" in df.columns:
-            df["kwh_per_week"] = pd.to_numeric(df["sessions_per_week"], errors="coerce") * pd.to_numeric(df["kwh_per_session"], errors="coerce")
-        else:
-            df["kwh_per_week"] = np.nan
+def compute_derived(df: pd.DataFrame) -> pd.DataFrame:
+    d = df.copy()
 
-    # Default breakdown if not present
-    if "value_total_eur_y" not in df.columns:
-        # Try sum breakdown
-        parts = []
-        for c in ["value_da_eur_y", "value_id_eur_y", "value_as_eur_y"]:
-            if c in df.columns:
-                parts.append(pd.to_numeric(df[c], errors="coerce").fillna(0.0))
-        if parts:
-            df["value_total_eur_y"] = sum(parts)
-        else:
-            df["value_total_eur_y"] = np.nan
+    d["kwh_per_session"] = pd.to_numeric(d["kwh_per_session"], errors="coerce")
+    d["sessions_per_week"] = pd.to_numeric(d["sessions_per_week"], errors="coerce")
+    d["plug_in_hour"] = pd.to_numeric(d["plug_in_hour"], errors="coerce")
+    d["plug_out_hour"] = pd.to_numeric(d["plug_out_hour"], errors="coerce")
+    d["value_eur_per_year"] = pd.to_numeric(d["value_eur_per_year"], errors="coerce")
 
-    for c in ["value_da_eur_y", "value_id_eur_y", "value_as_eur_y"]:
-        if c not in df.columns:
-            df[c] = np.nan
+    # Window length in hours across midnight
+    # Example: 18 -> 6 means (24-18)+6 = 12
+    pin = d["plug_in_hour"]
+    pout = d["plug_out_hour"]
+    d["window_hours"] = np.where(
+        pin.isna() | pout.isna(),
+        np.nan,
+        np.where(pout >= pin, pout - pin, (24 - pin) + pout)
+    )
 
-    # Convert numeric columns
-    numeric_cols = [
-        "sessions_per_week","kwh_per_session","avg_window_hours","override_rate",
-        "plugin_hour_mean","plugout_hour_mean","min_soc","target_soc_departure",
-        "ev_max_kw","ev_battery_kwh","pv_kwp","battery_kwh",
-        "hp_thermal_storage_kwhth","comfort_band_c",
-        "value_total_eur_y","value_da_eur_y","value_id_eur_y","value_as_eur_y",
-        "reliability_score","customer_impact_score","kwh_per_week"
-    ]
-    for c in numeric_cols:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+    d["kwh_per_week"] = d["kwh_per_session"] * d["sessions_per_week"]
 
-    # Clean override
-    if "override_rate" in df.columns:
-        df["override_rate"] = df["override_rate"].apply(lambda x: _clamp01(x) if pd.notnull(x) else np.nan)
+    # Weekend/weekday flags -> "weekend_share"
+    # If weekends_only => 1.0; weekdays_only => 0.0; else estimate from sessions/week:
+    # crude heuristic: if sessions_per_week <=2 assume weekend-ish 0.7; else 0.3
+    wo = d["weekends_only"].fillna(0).astype(int)
+    wd = d["weekdays_only"].fillna(0).astype(int)
+    s = d["sessions_per_week"]
 
-    # Reliability proxy if missing
-    if "reliability_score" not in df.columns or df["reliability_score"].isna().all():
-        # Simple proxy: long window helps, high overrides hurt
-        win = df.get("avg_window_hours", pd.Series(np.nan, index=df.index))
-        ov  = df.get("override_rate", pd.Series(np.nan, index=df.index)).fillna(0.0)
-        # map window 2..14h -> 0..1
-        rel = (win - 2.0) / (14.0 - 2.0)
-        rel = rel.clip(lower=0.0, upper=1.0).fillna(0.5)
-        rel = rel * (1.0 - ov.clip(0,1))
-        df["reliability_score"] = rel.clip(0,1)
+    weekend_share = np.where(
+        wo == 1, 1.0,
+        np.where(wd == 1, 0.0,
+                 np.where(s.isna(), np.nan,
+                          np.where(s <= 2, 0.7, 0.3)))
+    )
+    d["weekend_share"] = weekend_share
 
-    # Customer impact proxy if missing (higher = more impact)
-    if "customer_impact_score" not in df.columns or df["customer_impact_score"].isna().all():
-        # Impact rises with override rate and shorter windows (because scheduling becomes more intrusive)
-        win = df.get("avg_window_hours", pd.Series(np.nan, index=df.index)).fillna(8.0)
-        ov  = df.get("override_rate", pd.Series(np.nan, index=df.index)).fillna(0.0)
-        short_win = (8.0 - win) / 8.0  # window >8 reduces
-        impact = (0.6 * ov + 0.4 * short_win).clip(0,1)
-        df["customer_impact_score"] = impact
+    # Convenience features for analysis
+    d["is_time_variable_grid_fee"] = d["grid_fee_scenario"].astype(str).str.lower().str.contains("time").astype(int)
+    d["market_stack_simple"] = d["market_stack"].astype(str).str.upper().str.replace(" ", "")
 
-    # Fill context defaults
-    for c, default in [("country","DE"),("dso","(unknown)"),("price_regime","(unknown)"),("market_stack","DA+ID")]:
-        if c not in df.columns:
-            df[c] = default
-        df[c] = df[c].fillna(default).astype(str)
+    # crude "availability_quality" proxy (longer window better)
+    d["availability_quality"] = np.clip((d["window_hours"] - 2) / 12, 0, 1)
 
-    df["asset_type"] = df["asset_type"].astype(str).str.upper().str.replace(" ", "_")
+    # Value density metrics
+    d["eur_per_kwh_week"] = d["value_eur_per_year"] / d["kwh_per_week"].replace(0, np.nan)
+    d["eur_per_window_hour"] = d["value_eur_per_year"] / d["window_hours"].replace(0, np.nan)
 
-    return df
+    return d
 
-def generate_sample(n=2500, seed=7) -> pd.DataFrame:
-    rng = np.random.default_rng(seed)
+def segment_ev_row(r) -> str:
+    """
+    Simple behavior-first segments for EV (editable rules).
+    """
+    k = safe_float(r.get("kwh_per_session"))
+    s = safe_float(r.get("sessions_per_week"))
+    w = safe_float(r.get("window_hours"))
+    weekend_share = safe_float(r.get("weekend_share"))
 
-    asset = rng.choice(["EV","PV_BATTERY","HEAT_PUMP"], size=n, p=[0.55,0.30,0.15])
-    country = np.repeat("DE", n)  # ✅ FIXED
-    dso = rng.choice(["Westnetz","Avacon","Bayernwerk","Netze BW","(unknown)"], size=n, p=[0.22,0.18,0.18,0.18,0.24])
-    price_regime = rng.choice(["2024_hist","2025_hist","stress_high_vol"], size=n, p=[0.45,0.45,0.10])
-    market_stack = rng.choice(["DA+ID","DA+ID+FCR","DA+ID+aFRR","DA+ID+FCR+aFRR"], size=n, p=[0.55,0.15,0.15,0.15])
+    if any(pd.isna(x) for x in [k, s, w]):
+        return "UNCLASSIFIED"
 
-    sessions = rng.integers(1, 8, size=n)
-    kwh_sess = np.round(rng.uniform(6, 40, size=n), 1)
-    window = np.round(rng.uniform(2.0, 14.0, size=n), 1)
-    override = np.round(rng.beta(2, 8, size=n), 2)  # mostly low
+    # Weekend charger: low frequency, higher kWh, long window, weekend-heavy
+    if (2 <= s <= 3) and (k >= 18) and (w >= 8) and (weekend_share >= 0.5):
+        return "WEEKEND_CHARGER"
 
-    plugin_h = np.round(rng.normal(18, 2.5, size=n), 1).clip(0, 23)
-    plugout_h = (plugin_h + window).clip(0, 23)
+    # Daily commuter: high frequency, low/med kWh, decent window, weekday-heavy
+    if (s >= 5) and (k <= 18) and (w >= 7) and (weekend_share <= 0.4):
+        return "DAILY_COMMUTER"
 
-    # Tech
-    ev_max_kw = rng.choice([3.7, 7.4, 11.0], size=n, p=[0.25,0.45,0.30])
-    ev_batt = rng.choice([40, 55, 75], size=n, p=[0.35,0.40,0.25])
-    pv_kwp = np.round(rng.uniform(3, 12, size=n), 1)
-    batt_kwh = np.round(rng.uniform(5, 15, size=n), 1)
-    hp_store = np.round(rng.uniform(0, 30, size=n), 1)
-    comfort_band = np.round(rng.uniform(1.0, 2.5, size=n), 1)
+    # High-energy daily
+    if (s >= 5) and (k > 18):
+        return "HIGH_ENERGY_DAILY"
 
-    # Value signal (demo)
-    kwh_week = sessions * kwh_sess
-    rel = ((window - 2) / (14 - 2)).clip(0, 1) * (1 - override)
-    rel = np.clip(rel, 0, 1)
+    # Opportunistic / short window
+    if (w < 5) or (s <= 2):
+        return "OPPORTUNISTIC_SHORT_WINDOW"
 
-    asset_mult = np.where(asset == "EV", 1.0, np.where(asset == "PV_BATTERY", 1.15, 0.85))
-    stack_mult = np.vectorize({"DA+ID":1.0,"DA+ID+FCR":1.15,"DA+ID+aFRR":1.12,"DA+ID+FCR+aFRR":1.25}.get)(market_stack)
-    regime_mult = np.vectorize({"2024_hist":1.0,"2025_hist":0.95,"stress_high_vol":1.18}.get)(price_regime)
-
-    value_total = (0.045 * kwh_week * 52) * asset_mult * stack_mult * regime_mult * (0.5 + 0.5 * rel)
-    value_total = np.maximum(0, value_total + rng.normal(0, 25, size=n))
-
-    da_share = 0.55
-    id_share = 0.30
-    as_share = 0.15
-    value_da = value_total * da_share
-    value_id = value_total * id_share
-    value_as = value_total * as_share
-
-    df = pd.DataFrame({
-        "asset_type": asset,
-        "country": country,
-        "dso": dso,
-        "price_regime": price_regime,
-        "market_stack": market_stack,
-        "sessions_per_week": sessions,
-        "kwh_per_session": kwh_sess,
-        "avg_window_hours": window,
-        "override_rate": override,
-        "plugin_hour_mean": plugin_h,
-        "plugout_hour_mean": plugout_h,
-        "ev_max_kw": ev_max_kw,
-        "ev_battery_kwh": ev_batt,
-        "pv_kwp": pv_kwp,
-        "battery_kwh": batt_kwh,
-        "hp_thermal_storage_kwhth": hp_store,
-        "comfort_band_c": comfort_band,
-        "value_total_eur_y": value_total,
-        "value_da_eur_y": value_da,
-        "value_id_eur_y": value_id,
-        "value_as_eur_y": value_as,
-    })
-
-    return ensure_columns(df)
-
-# =========================================================
-# 2) Segmentation rules (behavior-first)
-# =========================================================
-def segment_ev(row) -> str:
-    s = row.get("sessions_per_week", np.nan)
-    k = row.get("kwh_per_session", np.nan)
-    w = row.get("avg_window_hours", np.nan)
-    o = row.get("override_rate", 0.0)
-
-    if pd.isna(s) or pd.isna(k) or pd.isna(w):
-        return "EV_UNCLASSIFIED"
-
-    kwh_week = s * k
-
-    if o >= 0.30:
-        return "EV_HIGH_OVERRIDE"
-
-    # A: Weekend charger (2–3 sessions/week, high kWh, long window)
-    if 2 <= s <= 3 and k >= 18 and w >= 8:
-        return "EV_WEEKEND_CHARGER"
-
-    # B: Daily commuter (5–7 sessions/week, low/med kWh, consistent overnight-ish)
-    if s >= 5 and k <= 18 and w >= 7:
-        return "EV_DAILY_COMMUTER"
-
-    # C: High-energy daily (>=5 sessions/week and high kWh)
-    if s >= 5 and k > 18:
-        return "EV_HIGH_ENERGY_DAILY"
-
-    # D: Opportunistic / short-window
-    if w < 5 or s <= 2:
-        return "EV_OPPORTUNISTIC_SHORT_WINDOW"
-
-    return "EV_STANDARD"
-
-def segment_pv_battery(row) -> str:
-    pv = row.get("pv_kwp", np.nan)
-    b = row.get("battery_kwh", np.nan)
-    o = row.get("override_rate", 0.0)  # if NA, treated as 0 elsewhere
-
-    if pd.isna(pv) or pd.isna(b):
-        return "PVB_UNCLASSIFIED"
-
-    if o >= 0.30:
-        return "PVB_HIGH_OVERRIDE"
-
-    # rough sizing heuristics
-    if pv >= 8 and b >= 10:
-        return "PVB_LARGE_SYSTEM"
-    if pv >= 6 and b < 10:
-        return "PVB_EXPORT_LEANING"
-    if pv < 6 and b >= 10:
-        return "PVB_STORAGE_HEAVY"
-    return "PVB_MID_SYSTEM"
-
-def segment_heat_pump(row) -> str:
-    store = row.get("hp_thermal_storage_kwhth", np.nan)
-    band = row.get("comfort_band_c", np.nan)
-    o = row.get("override_rate", 0.0)
-
-    if pd.isna(store) and pd.isna(band):
-        return "HP_UNCLASSIFIED"
-
-    if o >= 0.30:
-        return "HP_HIGH_OVERRIDE"
-
-    # inertia proxy: higher storage + wider band -> more flexible
-    store = 0.0 if pd.isna(store) else store
-    band = 1.5 if pd.isna(band) else band
-    inertia = (store / 20.0) + (band / 2.0)  # 0..~2
-
-    if inertia >= 1.3:
-        return "HP_HIGH_INERTIA"
-    if inertia >= 0.8:
-        return "HP_MED_INERTIA"
-    return "HP_LOW_INERTIA"
+    return "STANDARD"
 
 def apply_segmentation(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    seg = []
-    for _, r in df.iterrows():
-        a = str(r.get("asset_type","")).upper()
-        if a == "EV":
-            seg.append(segment_ev(r))
-        elif a in ["PV_BATTERY","PVB","PV&BATTERY","PV_BAT"]:
-            seg.append(segment_pv_battery(r))
-        elif a in ["HEAT_PUMP","HP"]:
-            seg.append(segment_heat_pump(r))
-        else:
-            seg.append("UNCLASSIFIED")
-    df["segment"] = seg
-    return df
+    d = df.copy()
+    d["segment"] = d.apply(segment_ev_row, axis=1)
+    return d
 
-# =========================================================
-# 3) Insight computations
-# =========================================================
-def segment_signature(df: pd.DataFrame) -> pd.DataFrame:
-    # p10/p50/p90 + composition + reliability/impact
-    def q(x, p): return np.nanpercentile(x, p) if np.isfinite(x).any() else np.nan
+def robust_corr(df: pd.DataFrame, x: str, y: str) -> float:
+    a = pd.to_numeric(df[x], errors="coerce")
+    b = pd.to_numeric(df[y], errors="coerce")
+    m = a.notna() & b.notna()
+    if m.sum() < 5:
+        return np.nan
+    return float(a[m].corr(b[m]))
 
-    g = df.groupby(["asset_type","segment"], dropna=False)
-    out = g.agg(
-        n=("value_total_eur_y","size"),
-        value_p10=("value_total_eur_y", lambda x: q(x.values, 10)),
-        value_p50=("value_total_eur_y", lambda x: q(x.values, 50)),
-        value_p90=("value_total_eur_y", lambda x: q(x.values, 90)),
-        rel_mean=("reliability_score","mean"),
-        impact_mean=("customer_impact_score","mean"),
-        da_mean=("value_da_eur_y","mean"),
-        id_mean=("value_id_eur_y","mean"),
-        as_mean=("value_as_eur_y","mean"),
-        total_mean=("value_total_eur_y","mean"),
-        overrides=("override_rate","mean"),
-        window=("avg_window_hours","mean"),
-        kwh_week=("kwh_per_week","mean"),
-        sessions=("sessions_per_week","mean"),
-        kwh_sess=("kwh_per_session","mean"),
+def binned_effect(df: pd.DataFrame, feature: str, target: str, bins=6):
+    x = pd.to_numeric(df[feature], errors="coerce")
+    y = pd.to_numeric(df[target], errors="coerce")
+    m = x.notna() & y.notna()
+    if m.sum() < 10:
+        return pd.DataFrame(columns=["bin", "count", "x_mid", "y_mean"])
+
+    xs = x[m]
+    ys = y[m]
+
+    # quantile bins (more stable with skewed data)
+    try:
+        q = pd.qcut(xs, q=bins, duplicates="drop")
+    except Exception:
+        q = pd.cut(xs, bins=bins)
+
+    out = pd.DataFrame({"bin": q, "x": xs, "y": ys}).groupby("bin", dropna=True).agg(
+        count=("y", "size"),
+        x_mid=("x", "median"),
+        y_mean=("y", "mean")
     ).reset_index()
 
-    # shares
-    denom = out["da_mean"].fillna(0)+out["id_mean"].fillna(0)+out["as_mean"].fillna(0)
-    denom = denom.replace(0, np.nan)
-    out["da_share"] = (out["da_mean"]/denom).fillna(0)
-    out["id_share"] = (out["id_mean"]/denom).fillna(0)
-    out["as_share"] = (out["as_mean"]/denom).fillna(0)
+    out["bin"] = out["bin"].astype(str)
+    return out.sort_values("x_mid")
 
-    # simple attractiveness & readiness scores (edit weights in UI later)
-    # attractiveness: value (p50) * reliability - impact penalty; scaled
-    out["attractiveness"] = (
-        (out["value_p50"].fillna(out["total_mean"]) * (0.5 + 0.5*out["rel_mean"].fillna(0.5)))
-        * (1.0 - 0.5*out["impact_mean"].fillna(0.3))
-    )
-    # readiness proxy: low overrides + good window + (optional) market stack simplicity
-    out["readiness"] = (
-        (1.0 - out["overrides"].fillna(0.1)).clip(0,1) * (out["window"].fillna(8)/12.0).clip(0,1)
-    ) * 100
+# =========================
+# UI
+# =========================
+st.title("⚡ EV Flex Value Segmentation Lab")
+st.caption("Manually log valuation outcomes by customer type & scenario → auto segmentation → insights & value-driver analysis.")
 
-    # normalize attractiveness to 0..100 for plotting
-    a = out["attractiveness"].replace([np.inf,-np.inf], np.nan).fillna(0)
-    if a.max() > 0:
-        out["attractiveness"] = (a / a.max()) * 100
-    else:
-        out["attractiveness"] = 0.0
+# Load
+if "db" not in st.session_state:
+    st.session_state.db = load_db()
 
-    return out
+db = st.session_state.db
 
-def propose_fit(row) -> str:
-    # quick proposition recommendation from signature
-    v = row.get("value_p50", 0)
-    rel = row.get("rel_mean", 0.5)
-    imp = row.get("impact_mean", 0.3)
-    ov = row.get("overrides", 0.1)
-    as_share = row.get("as_share", 0.0)
+# Sidebar filters
+st.sidebar.header("Filters")
+if len(db) == 0:
+    st.sidebar.info("No entries yet. Add scenarios using the form.")
 
-    if ov >= 0.30:
-        return "Behavior-shaping offer (nudges + guardrails) + small fixed bonus"
-    if rel >= 0.70 and imp <= 0.35 and v >= 120:
-        return "Simple fixed bonus (scale fast) or Hybrid (base + top-up)"
-    if v >= 120 and (rel < 0.70 or imp > 0.35):
-        return "Hybrid (base + performance top-up) to manage volatility/impact"
-    if as_share >= 0.25 and rel >= 0.70:
-        return "Hybrid + optional AS participation (reliability-based eligibility)"
-    return "Performance-based (ct/kWh shifted) or tiered bonus"
+asset_note = st.sidebar.markdown("**EV-only for now** ✅")
 
-# =========================================================
-# 4) Sidebar: data load + global filters
-# =========================================================
-st.sidebar.title("⚡ Flex Value Insights")
-
-with st.sidebar.expander("1) Load valuation results", expanded=True):
-    upload = st.file_uploader("Upload CSV (one row = one run)", type=["csv"])
-    use_sample = st.checkbox("Use sample data (if you don't have a file yet)", value=(upload is None))
-
-    if upload is not None and not use_sample:
-        df_raw = pd.read_csv(upload)
-        st.success(f"Loaded {len(df_raw):,} rows")
-    else:
-        df_raw = generate_sample(n=2500, seed=7)
-        st.info("Using built-in sample data (replace with your model export CSV).")
-
-df = ensure_columns(df_raw)
+# Derived + segmentation
+df = compute_derived(db)
 df = apply_segmentation(df)
 
-with st.sidebar.expander("2) Filters", expanded=False):
-    asset_filter = st.multiselect("Asset type", sorted(df["asset_type"].unique().tolist()), default=sorted(df["asset_type"].unique().tolist()))
-    country_filter = st.multiselect("Country", sorted(df["country"].unique().tolist()), default=sorted(df["country"].unique().tolist()))
-    dso_filter = st.multiselect("DSO", sorted(df["dso"].unique().tolist()), default=sorted(df["dso"].unique().tolist()))
-    stack_filter = st.multiselect("Market stack", sorted(df["market_stack"].unique().tolist()), default=sorted(df["market_stack"].unique().tolist()))
-    regime_filter = st.multiselect("Price regime", sorted(df["price_regime"].unique().tolist()), default=sorted(df["price_regime"].unique().tolist()))
+# Filter widgets
+market_options = sorted(df["market_stack"].dropna().astype(str).unique().tolist())
+grid_options = sorted(df["grid_fee_scenario"].dropna().astype(str).unique().tolist())
+seg_options = sorted(df["segment"].dropna().astype(str).unique().tolist())
 
-dff = df[
-    df["asset_type"].isin(asset_filter)
-    & df["country"].isin(country_filter)
-    & df["dso"].isin(dso_filter)
-    & df["market_stack"].isin(stack_filter)
-    & df["price_regime"].isin(regime_filter)
-].copy()
+f_market = st.sidebar.multiselect("Market stack", market_options, default=market_options)
+f_grid = st.sidebar.multiselect("Grid fee scenario", grid_options, default=grid_options)
+f_seg = st.sidebar.multiselect("Segment", seg_options, default=seg_options)
 
-sig = segment_signature(dff)
-sig["prop_fit"] = sig.apply(propose_fit, axis=1)
+dff = df.copy()
+if market_options:
+    dff = dff[dff["market_stack"].astype(str).isin(f_market)]
+if grid_options:
+    dff = dff[dff["grid_fee_scenario"].astype(str).isin(f_grid)]
+if seg_options:
+    dff = dff[dff["segment"].astype(str).isin(f_seg)]
 
-# =========================================================
-# 5) Navigation
-# =========================================================
-page = st.sidebar.radio(
-    "Navigate",
-    ["Executive Overview", "Segment Explorer", "Segment Value Signatures", "Roadmap Prioritization", "Data & Export"],
-    index=0
-)
+# Navigation
+tab1, tab2, tab3, tab4 = st.tabs(["➕ Enter Scenarios", "📋 Database", "📊 Insights", "🧠 Value Drivers"])
 
-# =========================================================
-# 6) Pages
-# =========================================================
-def kpi_row():
+# =========================
+# Tab 1: Entry form
+# =========================
+with tab1:
+    st.subheader("Enter a valuation outcome (one row = one customer type + scenario)")
+    colA, colB, colC = st.columns([1.2, 1.1, 1.2])
+
+    with colA:
+        label = st.text_input("Label (short name)", placeholder="e.g., Daily_3kWh_18to6")
+        kwh_per_session = st.number_input("kWh per session", min_value=0.0, value=3.0, step=0.5)
+        frequency_type = st.selectbox(
+            "Frequency pattern",
+            ["Daily", "X times per week", "Weekdays only", "Weekends only", "Custom days"],
+            index=0
+        )
+        if frequency_type == "Daily":
+            sessions_per_week = 7
+            weekdays_only = 0
+            weekends_only = 0
+            custom_days = ""
+            st.write("Sessions/week = 7 (fixed for Daily)")
+        elif frequency_type == "X times per week":
+            sessions_per_week = st.number_input("Sessions per week (1–7)", min_value=1, max_value=7, value=3, step=1)
+            weekdays_only = 0
+            weekends_only = 0
+            custom_days = ""
+        elif frequency_type == "Weekdays only":
+            sessions_per_week = 5
+            weekdays_only = 1
+            weekends_only = 0
+            custom_days = "Mon,Tue,Wed,Thu,Fri"
+            st.write("Sessions/week = 5 (fixed for Weekdays)")
+        elif frequency_type == "Weekends only":
+            sessions_per_week = 2
+            weekdays_only = 0
+            weekends_only = 1
+            custom_days = "Sat,Sun"
+            st.write("Sessions/week = 2 (fixed for Weekends)")
+        else:
+            custom_days = st.text_input("Custom days (comma separated)", value="Mon,Wed,Fri")
+            # try estimate sessions/week from number of days
+            days = [d.strip() for d in custom_days.split(",") if d.strip()]
+            sessions_per_week = len(days) if len(days) > 0 else 3
+            weekdays_only = 0
+            weekends_only = 0
+            st.write(f"Estimated sessions/week = {sessions_per_week} (based on custom days)")
+
+    with colB:
+        st.markdown("**Plug window**")
+        plug_in_hour = st.number_input("Plug-in hour (0–23)", min_value=0, max_value=23, value=18, step=1)
+        plug_out_hour = st.number_input("Plug-out hour (0–23)", min_value=0, max_value=23, value=6, step=1)
+        st.caption("If plug-out < plug-in, we assume it crosses midnight (e.g., 18 → 6 = 12h window).")
+
+        st.markdown("**Scenario setup**")
+        market_stack = st.selectbox("Optimisation stack", ["DA", "DA+ID", "DA+ID+aFRR", "DA+ID+FCR", "DA+ID+FCR+aFRR", "Other…"], index=1)
+        if market_stack == "Other…":
+            market_stack = st.text_input("Enter market stack label", value="DA+ID+...")
+        grid_fee_scenario = st.selectbox("Grid fee scenario", ["Standard grid fee", "Time-variable grid fee", "Other…"], index=0)
+        if grid_fee_scenario == "Other…":
+            grid_fee_scenario = st.text_input("Enter grid fee scenario label", value="My future scenario")
+
+        scenario_tag = st.text_input("Scenario tag (optional)", placeholder="e.g., DE_Westnetz_2025_hist")
+
+    with colC:
+        st.markdown("**Valuation output**")
+        value_eur_per_year = st.number_input("Flex value (€/year)", value=240.0, step=5.0)
+        notes = st.text_area("Notes (optional)", height=160, placeholder="Assumptions, special constraints, etc.")
+
+        st.markdown("---")
+        add = st.button("✅ Add entry", use_container_width=True)
+
+    if add:
+        new_row = {
+            "entry_id": f"E{len(db)+1:06d}",
+            "created_ts": now_ts(),
+            "label": (label.strip() if label and label.strip() else f"EV_{len(db)+1:06d}"),
+            "kwh_per_session": float(kwh_per_session),
+            "frequency_type": str(frequency_type),
+            "sessions_per_week": int(sessions_per_week),
+            "weekdays_only": int(weekdays_only),
+            "weekends_only": int(weekends_only),
+            "custom_days": str(custom_days),
+            "plug_in_hour": int(plug_in_hour),
+            "plug_out_hour": int(plug_out_hour),
+            "market_stack": str(market_stack),
+            "grid_fee_scenario": str(grid_fee_scenario),
+            "scenario_tag": str(scenario_tag),
+            "value_eur_per_year": float(value_eur_per_year),
+            "notes": str(notes),
+        }
+        db2 = pd.concat([db, pd.DataFrame([new_row])], ignore_index=True)
+        st.session_state.db = db2
+        save_db(db2)
+        st.success("Saved. Go to 'Database' or 'Insights' tabs.")
+        st.rerun()
+
+# =========================
+# Tab 2: Database view + edit actions
+# =========================
+with tab2:
+    st.subheader("Database (filtered)")
     c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        st.metric("Runs", f"{len(dff):,}")
-    with c2:
-        st.metric("Segments", f"{sig['segment'].nunique():,}")
-    with c3:
-        st.metric("Median value (€/asset/y)", f"{np.nanmedian(dff['value_total_eur_y']):.1f}")
-    with c4:
-        st.metric("Avg reliability", f"{np.nanmean(dff['reliability_score']):.2f}")
+    c1.metric("Entries (filtered)", f"{len(dff):,}")
+    c2.metric("Segments", f"{dff['segment'].nunique() if len(dff) else 0}")
+    c3.metric("Median value €/y", f"{np.nanmedian(dff['value_eur_per_year']):.1f}" if len(dff) else "—")
+    c4.metric("Median kWh/week", f"{np.nanmedian(dff['kwh_per_week']):.1f}" if len(dff) else "—")
 
-if page == "Executive Overview":
-    st.title("Executive Overview")
-    kpi_row()
-
-    st.subheader("Which segments are big and valuable?")
-    # Bubble: size vs value with reliability color
-    bubble = sig.copy()
-    bubble["size"] = bubble["n"]
-    bubble["value"] = bubble["value_p50"].fillna(bubble["total_mean"])
-    fig = px.scatter(
-        bubble,
-        x="size",
-        y="value",
-        color="rel_mean",
-        size="size",
-        hover_data=["asset_type","segment","value_p10","value_p50","value_p90","impact_mean","prop_fit"],
-        facet_col="asset_type",
-        title="Segment size vs median value (color = reliability)"
-    )
-    fig.update_layout(height=420)
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.subheader("Value composition by segment (DA / ID / AS)")
-    # stacked bars: mean by segment
-    topN = st.slider("Show top N segments by median value", 5, 30, 12)
-    top = sig.sort_values("value_p50", ascending=False).head(topN).copy()
-    top["label"] = top["asset_type"] + " | " + top["segment"]
-
-    comp = top[["label","da_share","id_share","as_share"]].melt(id_vars=["label"], var_name="channel", value_name="share")
-    fig2 = px.bar(comp, x="label", y="share", color="channel", barmode="stack", title="Average value share by channel")
-    fig2.update_layout(height=420, xaxis_title="", yaxis_title="Share")
-    st.plotly_chart(fig2, use_container_width=True)
-
-    st.subheader("What’s in it for them (customer impact vs value)")
-    fig3 = px.scatter(
-        sig,
-        x="impact_mean",
-        y="value_p50",
-        color="asset_type",
-        size="n",
-        hover_data=["segment","rel_mean","prop_fit"],
-        title="Median value vs customer impact (bigger = more runs)"
-    )
-    fig3.update_layout(height=420, xaxis_title="Customer impact (proxy)", yaxis_title="Median value (€/asset/year)")
-    st.plotly_chart(fig3, use_container_width=True)
-
-elif page == "Segment Explorer":
-    st.title("Segment Explorer")
-    kpi_row()
-
-    left, right = st.columns([1.1, 1.9])
-    with left:
-        st.subheader("Pick a segment")
-        asset_pick = st.selectbox("Asset", sorted(sig["asset_type"].unique()))
-        seg_pick = st.selectbox("Segment", sorted(sig[sig["asset_type"]==asset_pick]["segment"].unique()))
-        row = sig[(sig["asset_type"]==asset_pick) & (sig["segment"]==seg_pick)].iloc[0]
-
-        st.markdown("### Segment snapshot")
-        st.metric("Median value (€/y)", f"{row['value_p50']:.1f}")
-        st.metric("Reliability", f"{row['rel_mean']:.2f}")
-        st.metric("Customer impact", f"{row['impact_mean']:.2f}")
-        st.metric("Runs in filter", f"{int(row['n']):,}")
-
-        st.markdown("### Recommended proposition fit")
-        st.write(row["prop_fit"])
-
-        st.markdown("### Behavior averages")
-        st.write(pd.DataFrame({
-            "metric": ["sessions/week","kWh/session","kWh/week","window (h)","override rate"],
-            "value": [
-                row.get("sessions", np.nan),
-                row.get("kwh_sess", np.nan),
-                row.get("kwh_week", np.nan),
-                row.get("window", np.nan),
-                row.get("overrides", np.nan),
-            ]
-        }))
-
-    with right:
-        st.subheader("Distribution: value (€/asset/year)")
-        seg_df = dff[(dff["asset_type"]==asset_pick) & (dff["segment"]==seg_pick)].copy()
-
-        fig = px.histogram(seg_df, x="value_total_eur_y", nbins=40, title="Value distribution")
-        fig.update_layout(height=360, xaxis_title="€/asset/year", yaxis_title="Count")
-        st.plotly_chart(fig, use_container_width=True)
-
-        st.subheader("Drivers (simple, interpretable view)")
-        # show how value varies with a few key knobs
-        c1, c2 = st.columns(2)
-        with c1:
-            figA = px.scatter(seg_df, x="avg_window_hours", y="value_total_eur_y", trendline="ols",
-                              title="Value vs availability window")
-            figA.update_layout(height=320, xaxis_title="avg_window_hours", yaxis_title="€/asset/year")
-            st.plotly_chart(figA, use_container_width=True)
-        with c2:
-            figB = px.scatter(seg_df, x="override_rate", y="value_total_eur_y", trendline="ols",
-                              title="Value vs override rate")
-            figB.update_layout(height=320, xaxis_title="override_rate", yaxis_title="€/asset/year")
-            st.plotly_chart(figB, use_container_width=True)
-
-        st.subheader("Channel breakdown (mean)")
-        mean_break = seg_df[["value_da_eur_y","value_id_eur_y","value_as_eur_y"]].mean(numeric_only=True).fillna(0)
-        pie = pd.DataFrame({"channel": mean_break.index, "eur_y": mean_break.values})
-        figC = px.pie(pie, names="channel", values="eur_y", title="Mean contribution by channel")
-        figC.update_layout(height=320)
-        st.plotly_chart(figC, use_container_width=True)
-
-elif page == "Segment Value Signatures":
-    st.title("Segment Value Signatures")
-    kpi_row()
-
-    st.subheader("Signature table (p10 / p50 / p90, composition, reliability, impact)")
     show_cols = [
-        "asset_type","segment","n",
-        "value_p10","value_p50","value_p90",
-        "rel_mean","impact_mean",
-        "da_share","id_share","as_share",
-        "sessions","kwh_sess","kwh_week","window","overrides",
-        "prop_fit"
+        "entry_id","created_ts","label",
+        "kwh_per_session","sessions_per_week","frequency_type",
+        "plug_in_hour","plug_out_hour","window_hours",
+        "market_stack","grid_fee_scenario","scenario_tag",
+        "value_eur_per_year","kwh_per_week","eur_per_kwh_week",
+        "segment","notes"
     ]
-    st.dataframe(sig[show_cols].sort_values(["asset_type","value_p50"], ascending=[True,False]), use_container_width=True, height=520)
+    st.dataframe(dff[show_cols].sort_values("created_ts", ascending=False), use_container_width=True, height=420)
 
-    st.subheader("Heatmap: median value by segment")
-    pivot = sig.pivot_table(index="segment", columns="asset_type", values="value_p50", aggfunc="mean")
-    pivot = pivot.sort_values(by=pivot.columns.tolist(), ascending=False, na_position="last")
-    fig = px.imshow(pivot.fillna(0), aspect="auto", title="Median value heatmap (€/asset/year)")
-    fig.update_layout(height=520)
-    st.plotly_chart(fig, use_container_width=True)
+    st.markdown("### Export / reset")
+    colx, coly = st.columns([1,1])
+    with colx:
+        csv_bytes = dff.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Download filtered CSV", data=csv_bytes, file_name="ev_value_db_filtered.csv", mime="text/csv", use_container_width=True)
+    with coly:
+        if st.button("🗑️ Delete ALL entries (danger)", type="secondary", use_container_width=True):
+            st.session_state.db = pd.DataFrame(columns=BASE_COLUMNS)
+            save_db(st.session_state.db)
+            st.warning("All entries deleted.")
+            st.rerun()
 
-elif page == "Roadmap Prioritization":
-    st.title("Roadmap Prioritization")
-    kpi_row()
+# =========================
+# Tab 3: Insights
+# =========================
+with tab3:
+    st.subheader("Insights: segments × scenarios")
 
-    st.subheader("Attractiveness vs Readiness (segment roadmap)")
-    # Allow tuning weights quickly
-    with st.expander("Tune scoring (optional)", expanded=False):
-        st.write("These weights are simple heuristics. You can later replace with your internal scoring model.")
-        w_rel = st.slider("Reliability weight", 0.0, 1.0, 0.6, 0.05)
-        w_imp = st.slider("Impact penalty", 0.0, 1.0, 0.4, 0.05)
-        w_val = st.slider("Value weight", 0.0, 2.0, 1.0, 0.1)
-        # recompute attractiveness quickly (still normalized)
-        s2 = sig.copy()
-        raw = (w_val * s2["value_p50"].fillna(s2["total_mean"])) * (0.5 + w_rel*s2["rel_mean"].fillna(0.5)) * (1.0 - w_imp*s2["impact_mean"].fillna(0.3))
-        raw = raw.replace([np.inf,-np.inf], np.nan).fillna(0)
-        s2["attractiveness"] = (raw / raw.max() * 100) if raw.max() > 0 else 0.0
-        sig_plot = s2
-    if "sig_plot" not in locals():
-        sig_plot = sig.copy()
+    if len(dff) < 3:
+        st.info("Add a few scenarios first to see segment insights.")
+    else:
+        # Segment signature table
+        g = dff.groupby(["segment","market_stack","grid_fee_scenario"], dropna=False)
+        sig = g.agg(
+            n=("value_eur_per_year","size"),
+            p10=("value_eur_per_year", lambda x: np.nanpercentile(x,10)),
+            p50=("value_eur_per_year", lambda x: np.nanpercentile(x,50)),
+            p90=("value_eur_per_year", lambda x: np.nanpercentile(x,90)),
+            kwhwk=("kwh_per_week","mean"),
+            win=("window_hours","mean"),
+            eur_per_kwhwk=("eur_per_kwh_week","mean")
+        ).reset_index().sort_values(["p50","n"], ascending=[False, False])
 
-    sig_plot["label"] = sig_plot["asset_type"] + " | " + sig_plot["segment"]
-    fig = px.scatter(
-        sig_plot,
-        x="readiness",
-        y="attractiveness",
-        color="asset_type",
-        size="n",
-        hover_data=["segment","value_p50","rel_mean","impact_mean","prop_fit","da_share","id_share","as_share"],
-        title="Roadmap map (bigger bubble = more runs)"
-    )
-    fig.update_layout(height=520, xaxis_title="Execution readiness (proxy, 0..100)", yaxis_title="Segment attractiveness (0..100)")
-    st.plotly_chart(fig, use_container_width=True)
+        st.markdown("### Segment signatures (by market stack & grid fee scenario)")
+        st.dataframe(sig, use_container_width=True, height=360)
 
-    st.subheader("Top roadmap candidates (by combined score)")
-    sig_plot["combined"] = 0.55*sig_plot["attractiveness"] + 0.45*sig_plot["readiness"]
-    top = sig_plot.sort_values("combined", ascending=False).head(15)
-    st.dataframe(
-        top[["asset_type","segment","n","value_p50","rel_mean","impact_mean","readiness","attractiveness","combined","prop_fit"]]
-        .reset_index(drop=True),
-        use_container_width=True
-    )
+        # Simple “where is it worth targeting” view:
+        st.markdown("### Targeting map (median value vs kWh/week)")
+        pivot = dff.groupby(["segment"]).agg(
+            n=("value_eur_per_year","size"),
+            value_p50=("value_eur_per_year", lambda x: np.nanpercentile(x,50)),
+            kwh_p50=("kwh_per_week", lambda x: np.nanpercentile(x,50)),
+            win_mean=("window_hours","mean"),
+        ).reset_index()
 
-    st.info(
-        "Tip: Use this page in steering meetings: filter by country/DSO/market_stack/price_regime on the left to see how priorities shift."
-    )
+        # Use Streamlit native charts (no extra libs)
+        st.scatter_chart(
+            pivot.rename(columns={"kwh_p50":"kwh_per_week_p50", "value_p50":"value_eur_y_p50"})[["kwh_per_week_p50","value_eur_y_p50"]],
+            x="kwh_per_week_p50",
+            y="value_eur_y_p50",
+            height=300
+        )
+        st.caption("Interpretation: right-up is best (high energy + high value). Add filters on the left to compare DA vs DA+ID vs AS, Standard vs Time-variable.")
 
-elif page == "Data & Export":
-    st.title("Data & Export")
-    st.write("Use this to validate your export, check missing columns, and download the enriched dataset (with segments).")
+        st.markdown("### Best segments by scenario (top median value)")
+        topN = st.slider("Top N rows", 5, 25, 10)
+        best = sig.head(topN).copy()
+        st.dataframe(best, use_container_width=True)
 
-    st.subheader("Column coverage check")
-    missing = [c for c in RECOMMENDED_COLUMNS if c not in df_raw.columns]
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("**Found columns**")
-        st.write(sorted(df_raw.columns.tolist()))
-    with c2:
-        st.markdown("**Missing recommended columns** (not mandatory)")
-        st.write(missing if missing else "None 🎉")
+        st.markdown("### Quick narrative (auto)")
+        # Simple narrative: where time-variable helps most, and which market stack adds value
+        def median_by(mask):
+            x = dff.loc[mask, "value_eur_per_year"]
+            return float(np.nanpercentile(x,50)) if x.notna().sum() >= 3 else np.nan
 
-    st.subheader("Preview (filtered)")
-    st.dataframe(dff.head(200), use_container_width=True, height=420)
+        # time-variable vs standard delta
+        tv = dff["grid_fee_scenario"].astype(str).str.lower().str.contains("time")
+        std = dff["grid_fee_scenario"].astype(str).str.lower().str.contains("standard")
+        tv_med = median_by(tv)
+        std_med = median_by(std)
+        if not np.isnan(tv_med) and not np.isnan(std_med):
+            st.write(f"- Median value under **Time-variable grid fee**: **{tv_med:.1f} €/y** vs **Standard**: **{std_med:.1f} €/y** → delta **{(tv_med-std_med):+.1f} €/y** (within current filters).")
 
-    st.subheader("Download enriched data")
-    csv_bytes = dff.to_csv(index=False).encode("utf-8")
-    st.download_button("⬇️ Download filtered + segmented CSV", data=csv_bytes, file_name="flex_value_enriched_segmented.csv", mime="text/csv")
+        # DA vs DA+ID vs DA+ID+AS
+        def has_stack(s): return dff["market_stack"].astype(str).str.upper().str.replace(" ", "").eq(s)
+        da_med = median_by(has_stack("DA"))
+        daid_med = median_by(has_stack("DA+ID"))
+        daid_afrr_med = median_by(has_stack("DA+ID+AFRR"))
+        if not np.isnan(da_med): st.write(f"- **DA** median: **{da_med:.1f} €/y**")
+        if not np.isnan(daid_med): st.write(f"- **DA+ID** median: **{daid_med:.1f} €/y** (Δ vs DA: {(daid_med-da_med):+.1f} €/y)" if not np.isnan(da_med) else f"- **DA+ID** median: **{daid_med:.1f} €/y**")
+        if not np.isnan(daid_afrr_med): st.write(f"- **DA+ID+aFRR** median: **{daid_afrr_med:.1f} €/y**")
 
-    st.subheader("Download segment signatures")
-    sig_bytes = sig.to_csv(index=False).encode("utf-8")
-    st.download_button("⬇️ Download segment_signature.csv", data=sig_bytes, file_name="segment_signature.csv", mime="text/csv")
+# =========================
+# Tab 4: Value driver analysis
+# =========================
+with tab4:
+    st.subheader("Value drivers (what explains €/year?)")
 
-# =========================================================
-# Footer
-# =========================================================
+    if len(dff) < 10:
+        st.info("Add at least ~10 scenarios for the driver analysis to become meaningful.")
+    else:
+        # Correlations (simple but useful)
+        feats = ["kwh_per_session","sessions_per_week","kwh_per_week","window_hours","weekend_share","availability_quality","is_time_variable_grid_fee"]
+        corr_rows = []
+        for f in feats:
+            corr_rows.append({"feature": f, "corr_with_value": robust_corr(dff, f, "value_eur_per_year")})
+        corr_df = pd.DataFrame(corr_rows).sort_values("corr_with_value", ascending=False)
+        st.markdown("### Correlation ranking (directional)")
+        st.dataframe(corr_df, use_container_width=True, height=260)
+        st.caption("Correlation is not causality, but it quickly tells you what moves together with value in your runs.")
+
+        # Binned effects
+        st.markdown("### Binned effects (how value changes across ranges)")
+        feature_pick = st.selectbox("Pick a feature", ["kwh_per_week","window_hours","sessions_per_week","kwh_per_session","weekend_share"])
+        be = binned_effect(dff, feature_pick, "value_eur_per_year", bins=6)
+        st.dataframe(be, use_container_width=True, height=240)
+        st.line_chart(be.set_index("x_mid")["y_mean"], height=250)
+        st.caption("Look for saturation (diminishing returns), thresholds, and non-linear effects.")
+
+        # Scenario deltas by categories
+        st.markdown("### Scenario deltas (stack & grid fee)")
+        # median by market_stack
+        med_stack = dff.groupby("market_stack")["value_eur_per_year"].median().sort_values(ascending=False)
+        st.write("**Median €/year by market stack (within filters):**")
+        st.dataframe(med_stack.reset_index().rename(columns={"value_eur_per_year":"median_value_eur_y"}), use_container_width=True)
+
+        med_grid = dff.groupby("grid_fee_scenario")["value_eur_per_year"].median().sort_values(ascending=False)
+        st.write("**Median €/year by grid fee scenario:**")
+        st.dataframe(med_grid.reset_index().rename(columns={"value_eur_per_year":"median_value_eur_y"}), use_container_width=True)
+
+        # Segment x scenario heatmap-style pivot table
+        st.markdown("### Segment × Market Stack (median value table)")
+        pivot = dff.pivot_table(index="segment", columns="market_stack", values="value_eur_per_year", aggfunc="median")
+        st.dataframe(pivot, use_container_width=True, height=320)
+
 st.markdown(
-    """
-    <div style="margin-top:20px; font-size:12px; color:#888;">
-    Model outputs → Flex Value Cube → Segments → Value Signatures → Proposition Fit → Roadmap.
-    </div>
-    """,
+    "<div style='margin-top:16px; font-size:12px; color:#777;'>"
+    "Data saved to <code>data/ev_value_db.csv</code> in your Streamlit project folder."
+    "</div>",
     unsafe_allow_html=True
 )

@@ -142,7 +142,7 @@ def generate_sample(n=2500, seed=7) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
 
     asset = rng.choice(["EV","PV_BATTERY","HEAT_PUMP"], size=n, p=[0.55,0.30,0.15])
-    country = np.array(["DE"])*n
+    country = np.repeat("DE", n)  # ✅ FIXED
     dso = rng.choice(["Westnetz","Avacon","Bayernwerk","Netze BW","(unknown)"], size=n, p=[0.22,0.18,0.18,0.18,0.24])
     price_regime = rng.choice(["2024_hist","2025_hist","stress_high_vol"], size=n, p=[0.45,0.45,0.10])
     market_stack = rng.choice(["DA+ID","DA+ID+FCR","DA+ID+aFRR","DA+ID+FCR+aFRR"], size=n, p=[0.55,0.15,0.15,0.15])
@@ -151,8 +151,9 @@ def generate_sample(n=2500, seed=7) -> pd.DataFrame:
     kwh_sess = np.round(rng.uniform(6, 40, size=n), 1)
     window = np.round(rng.uniform(2.0, 14.0, size=n), 1)
     override = np.round(rng.beta(2, 8, size=n), 2)  # mostly low
-    plugin_h = np.round(rng.normal(18, 2.5, size=n), 1).clip(0,23)
-    plugout_h = (plugin_h + window).clip(0,23)
+
+    plugin_h = np.round(rng.normal(18, 2.5, size=n), 1).clip(0, 23)
+    plugout_h = (plugin_h + window).clip(0, 23)
 
     # Tech
     ev_max_kw = rng.choice([3.7, 7.4, 11.0], size=n, p=[0.25,0.45,0.30])
@@ -162,25 +163,21 @@ def generate_sample(n=2500, seed=7) -> pd.DataFrame:
     hp_store = np.round(rng.uniform(0, 30, size=n), 1)
     comfort_band = np.round(rng.uniform(1.0, 2.5, size=n), 1)
 
-    # Base value signal (very simplified, just for demo)
+    # Value signal (demo)
     kwh_week = sessions * kwh_sess
-    rel = ((window - 2)/(14-2)).clip(0,1) * (1 - override)
+    rel = ((window - 2) / (14 - 2)).clip(0, 1) * (1 - override)
     rel = np.clip(rel, 0, 1)
 
-    # asset multipliers
-    asset_mult = np.where(asset=="EV", 1.0, np.where(asset=="PV_BATTERY", 1.15, 0.85))
+    asset_mult = np.where(asset == "EV", 1.0, np.where(asset == "PV_BATTERY", 1.15, 0.85))
     stack_mult = np.vectorize({"DA+ID":1.0,"DA+ID+FCR":1.15,"DA+ID+aFRR":1.12,"DA+ID+FCR+aFRR":1.25}.get)(market_stack)
     regime_mult = np.vectorize({"2024_hist":1.0,"2025_hist":0.95,"stress_high_vol":1.18}.get)(price_regime)
 
-    # value in €/year
-    value_total = (0.045 * kwh_week * 52) * asset_mult * stack_mult * regime_mult * (0.5 + 0.5*rel)
-    # add noise
+    value_total = (0.045 * kwh_week * 52) * asset_mult * stack_mult * regime_mult * (0.5 + 0.5 * rel)
     value_total = np.maximum(0, value_total + rng.normal(0, 25, size=n))
 
-    # breakdown (rough)
-    da_share = np.where(np.isin(market_stack, ["DA+ID","DA+ID+FCR","DA+ID+aFRR","DA+ID+FCR+aFRR"]), 0.55, 0.6)
+    da_share = 0.55
     id_share = 0.30
-    as_share = 1 - da_share - id_share
+    as_share = 0.15
     value_da = value_total * da_share
     value_id = value_total * id_share
     value_as = value_total * as_share
@@ -208,6 +205,7 @@ def generate_sample(n=2500, seed=7) -> pd.DataFrame:
         "value_id_eur_y": value_id,
         "value_as_eur_y": value_as,
     })
+
     return ensure_columns(df)
 
 # =========================================================
